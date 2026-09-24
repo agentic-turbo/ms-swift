@@ -1,0 +1,18 @@
+diff --git a/mindspeed/te/pytorch/module/grouped_linear.py b/mindspeed/te/pytorch/module/grouped_linear.py
+index 4c611c6a..93f9dbfd 100644
+--- a/mindspeed/te/pytorch/module/grouped_linear.py
++++ b/mindspeed/te/pytorch/module/grouped_linear.py
+@@ -159,6 +159,13 @@ class TEGroupedLinear(torch.nn.Module):
+                                                   world_size=tp_size)
+                 else:
+                     _initialize_affine_weight_gpu(expert_weight, init_method, partition_dim=self.partition_dim, stride=1, is_expert=is_expert)
++            # Fix missing TP metadata when perform_initialization=False
++            if not hasattr(expert_weight, "tensor_model_parallel"):
++                setattr(
++                    expert_weight,
++                    "tensor_model_parallel",
++                    True,
++                )
+             self.total_weight.append(expert_weight)
+ 
+         for param in self.parameters():
