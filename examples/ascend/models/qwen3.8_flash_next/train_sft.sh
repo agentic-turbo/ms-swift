@@ -20,6 +20,7 @@ export QWEN_CHECKPOINT_TIMEOUT_SECOND=3600
 export USE_MCORE_GDN=1
 export IMAGE_MAX_TOKEN_NUM=256
 export PLE_CPU_OFFLOAD=0
+export PLE_FUSED_KERNEL=0
 
 export MODEL=/path/to/Qwen3.8-Flash-Next
 export DATASET=/path/to/dataset
