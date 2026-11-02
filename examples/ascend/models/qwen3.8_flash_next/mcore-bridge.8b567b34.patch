@@ -1,0 +1,1740 @@
+diff --git a/src/mcore_bridge/config/model_config.py b/src/mcore_bridge/config/model_config.py
+index 942f2cf2ed9ee1f0a5bc29e9d6b77ead72945492..8ffc36ca3ad0f286453ef93a1f99784c813b6252 100644
+--- a/src/mcore_bridge/config/model_config.py
++++ b/src/mcore_bridge/config/model_config.py
+@@ -122,6 +122,11 @@ class ModelConfig(TransformerConfig):
+     rope_scaling: Optional[Union[dict, str]] = None
+     attention_scaling: float = 1.
+ 
++    # Custom NPU fusion.
++    use_npu_fusion_rmsnorm: bool = False
++    use_npu_fusion_rope: bool = False
++    use_npu_fusion_ple_conv: bool = False
++
+     # model
+     num_layers: Optional[int] = None
+     hidden_size: Optional[int] = None
+diff --git a/src/mcore_bridge/model/gpts/qwen3_next.py b/src/mcore_bridge/model/gpts/qwen3_next.py
+index f7219b400248c9037b39f6dad8ae1cac91cda26c..14d4468897325fd42120bf6902993e2879a71bcb 100644
+--- a/src/mcore_bridge/model/gpts/qwen3_next.py
++++ b/src/mcore_bridge/model/gpts/qwen3_next.py
+@@ -87,6 +87,14 @@ class Qwen3NextRMSNorm(torch.nn.Module):
+         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+ 
+     def forward(self, hidden_states):
++        if (getattr(self.config, 'use_npu_fusion_rmsnorm', False) and hidden_states.device.type == 'npu'
++                and hidden_states.numel() > 0):
++            import torch_npu
++
++            # Preserve FP32 normalization and zero-centered affine before the final cast.
++            weight = 1.0 + self.weight.float()
++            output = torch_npu.npu_rms_norm(hidden_states.float(), weight, epsilon=self.eps)[0]
++            return output.type_as(hidden_states)
+         output = self._norm(hidden_states.float())
+         # Zero-Centered: use (1 + weight) instead of weight
+         # This matches HuggingFace's Qwen3NextRMSNorm exactly
+diff --git a/src/mcore_bridge/model/gpts/qwen4_exp.py b/src/mcore_bridge/model/gpts/qwen4_exp.py
+index db2b0e69e9f6d78288043e309871d103c233cde7..7cfacd47f3ee19f20decb40ed87dc3b6b68d02bb 100644
+--- a/src/mcore_bridge/model/gpts/qwen4_exp.py
++++ b/src/mcore_bridge/model/gpts/qwen4_exp.py
+@@ -1,7 +1,6 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+ import copy
+ import math
+-import megatron.core
+ import torch
+ import torch.distributed as dist
+ import torch.nn.functional as F
+@@ -16,14 +15,14 @@ from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_par
+                                                     scatter_to_sequence_parallel_region)
+ from megatron.core.transformer.enums import AttnMaskType
+ from megatron.core.transformer.identity_op import IdentityOp
+-from megatron.core.transformer.spec_utils import ModuleSpec
++from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+ from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+ from megatron.core.utils import make_viewless_tensor
+ from torch import nn
+ from transformers.utils import is_torch_npu_available
+ from typing import List, Optional
+ 
+-from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
++from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger, is_master
+ from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
+ 
+ from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, MultiTokenPredictionLayer, QSAIndexer,
+@@ -322,25 +321,76 @@ class Qwen4ExpMTPStreamNorm(nn.Module):
+         return ((1.0 + self.weight.float()) * x).to(input_dtype)
+ 
+ 
++def _has_native_split_mtp_projection(submodules) -> bool:
++    """Whether Megatron declares split MTP projections in its submodule dataclass.
++
++    Check the class-level dataclass fields rather than instance attributes: the 0.16 compatibility
++    path attaches e_proj/h_proj dynamically, and those attributes must not make it look native.
++    """
++    fields = getattr(type(submodules), '__dataclass_fields__', {})
++    return 'e_proj' in fields and 'h_proj' in fields
++
++
+ class Qwen4ExpMultiTokenPredictionLayer(MultiTokenPredictionLayer):
+     """Qwen3.8-Flash-Next MTP head: the ``residual_linear_shared`` fusion over the gated-HC backbone.
+ 
+-    The backbone runs Qwen4Exp's own gated hyper-connections (``hc_count`` streams) but NOT Megatron's
+-    ``enable_hyper_connections`` mHC. The MTP head still needs Megatron's mHC *projection* form
+-    (separate ``e_proj``/``h_proj`` rather than a fused ``eh_proj``), because the checkpoint stores
+-    ``fc_embedding``/``fc_hidden`` (H->H each) and adds the embedding residual to every stream. So the
+-    subtree is built with hyper-connections enabled via a config copy -- which selects e_proj/h_proj --
+-    then Megatron's mHC-only contraction params (``hc_head_*``) and ``final_layernorm`` are dropped in
+-    favour of Qwen4Exp's own ``hyper_connection_mixer``, matching the checkpoint and the vLLM draft
+-    model. ``_concat_embeddings`` normalizes the multi-stream jointly (``Qwen4ExpMTPStreamNorm``) and
+-    ``_postprocess`` contracts with the mixer, so the layer returns the multi-stream and the MTP block
+-    applies ``_postprocess`` for the loss head.
++    The backbone runs Qwen4Exp's own gated hyper-connections (``hc_count`` streams), not Megatron's
++    mHC implementation. The checkpoint stores separate ``fc_embedding``/``fc_hidden`` projections
++    (H->H each). Megatron versions that expose native split MTP projections retain their original
++    construction path; Megatron-Core 0.16 gets the same modules from a bridge compatibility path after
++    its mandatory fused ``eh_proj`` construction is replaced with an identity. ``_concat_embeddings``
++    always follows the checkpoint's split-projection semantics, and ``_postprocess`` contracts with
++    Qwen4Exp's own mixer exactly once for the loss head.
+     """
+ 
+     def __init__(self, config, submodules, *args, **kwargs):
+         mtp_config = copy.copy(config)
+-        mtp_config.enable_hyper_connections = True
+-        super().__init__(mtp_config, submodules, *args, **kwargs)
++        if _has_native_split_mtp_projection(submodules):
++            # Preserve the original Megatron-main path: the parent creates e_proj/h_proj and sets its own multi-stream forward state.
++            mtp_config.enable_hyper_connections = True
++            super().__init__(mtp_config, submodules, *args, **kwargs)
++        else:
++            # Megatron-Core 0.16 unconditionally constructs eh_proj. 
++            # An IdentityOp lets the parent set up norms, process groups, and the inner transformer layer without allocating the wrong 2H->H projection. Restore the shared spec because another build may reuse it.
++            pg_collection = kwargs.get('pg_collection')
++            if pg_collection is None and len(args) > 2:
++                pg_collection = args[2]
++            eh_proj = submodules.eh_proj
++            submodules.eh_proj = IdentityOp
++            try:
++                super().__init__(mtp_config, submodules, *args, **kwargs)
++            finally:
++                submodules.eh_proj = eh_proj
++
++            # 0.16 only retains cp_group on the parent layer; keep its TP group for the split projections and for this class's gather/scatter operations. 
++            # Passing None deliberately preserves Megatron's fallback to the globally initialized TP group.
++            self.tp_group = getattr(pg_collection, 'tp', None)
++            projection_kwargs = {
++                'config': self.config,
++                'init_method': self.config.init_method,
++                'gather_output': False,
++                'bias': False,
++                'skip_bias_add': False,
++                'is_expert': False,
++                'tp_group': self.tp_group,
++            }
++            self.e_proj = build_module(
++                submodules.e_proj,
++                self.config.hidden_size,
++                self.config.hidden_size,
++                tp_comm_buffer_name='mtp_e_proj',
++                **projection_kwargs,
++            )
++            self.h_proj = build_module(
++                submodules.h_proj,
++                self.config.hidden_size,
++                self.config.hidden_size,
++                tp_comm_buffer_name='mtp_h_proj',
++                **projection_kwargs,
++            )
++            self.eh_proj = None
++            # Bridge-local control only: keep n*H until the MTP block invokes the Qwen mixer.
++            self.mhc_enabled = True
+         for name in ('hc_head_fn', 'hc_head_base', 'hc_head_scale', 'final_layernorm'):
+             if hasattr(self, name):
+                 delattr(self, name)
+@@ -456,8 +506,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
+         return int(holder.item())
+ 
+     def _broadcast_pp_weight(self, tensor, pp_src_rank: int):
+-        """Cross-pp transfer of one exported weight through the tp-aligned pp
+-        group. `tensor` is non-None only on the exporting rank (tp rank 0 of the
++        """Cross-pp transfer of one exported weight through the aligned pp
++        group. `tensor` is non-None only on the exporting rank (EP leader of the
+         stage owning the PLE layer, i.e. the src of its pp group); the other pp
+         members receive it. The payload is streamed through
+         `_chunked_broadcast_pp` so no full-size GPU buffer is materialized, and
+@@ -465,7 +515,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
+         low-width dtype (fp8 e4m3/e5m2, int8, packed fp4, ...) is transported
+         without NCCL dtype concerns; the meta carries the original shape/dtype
+         for the receiver to view back. Groups whose src has nothing to transfer
+-        (tp != 0 coords) exchange only the empty meta.
++        (EP non-leader coordinates) exchange only the empty meta.
+         """
+         meta = [None if tensor is None else [list(tensor.shape), str(tensor.dtype).replace('torch.', '')]]
+         dist.broadcast_object_list(meta, src=pp_src_rank, group=self.pp_group)
+@@ -483,26 +533,26 @@ class Qwen4ExpBridge(Qwen3NextBridge):
+ 
+     def _iter_ple_table_export(self, ple, pp_src_rank, layer_prefix: str):
+         """Lazily export the PLE table shards one by one. On the exporting rank
+-        (tp rank 0 of the owning stage) each shard is assembled by the chunked
++        (EP leader of the owning stage) each shard is assembled by the chunked
+         all_reduce inside ``iter_export_table_to_hf`` and immediately streamed
+         to the other pp members; on the other stages it is received as it
+         arrives. Nothing accumulates: only the consumer (the safetensors
+         writer) drives the pace, so no rank ever holds more than a single shard
+         of the 100GB-scale table in host memory. The per-shard collectives keep
+-        every rank of the tp-aligned pp groups in lockstep, exactly like the
++        every rank of the aligned pp groups in lockstep, exactly like the
+         synchronous version this generator replaces.
+         """
+         parts = self.config.split_ngram_parts
+         scale_key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
+         shard_prefix = 'ple.ple_embedding.ngram_embedding'
+-        # On tp != 0 ranks of the owning stage the table iterator executes the
+-        # same all_reduces but yields nothing (shards exist only on tp rank 0).
++        # All EP owners consume one item per shard. Non-leaders receive None;
++        # never filter ranks before these EP and PP collectives have executed.
+         table_iter = ple.ple_embedding.iter_export_table_to_hf() if ple is not None else iter(())
+         for i in range(parts):
+             shard = next(table_iter, (None, None))[1] if ple is not None else None
+             if self.pp_size > 1:
+                 shard = self._broadcast_pp_weight(shard, pp_src_rank)
+-            if shard is not None:
++            if shard is not None and (not self._only_master_rank or is_master()):
+                 yield f'{layer_prefix}{shard_prefix}.shard_{i}.weight', shard
+         # The scale is a tiny scalar; a pickled broadcast is fine.
+         scale = None
+@@ -514,7 +564,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
+             obj = [scale]
+             dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
+             scale = obj[0]
+-        if scale is not None:
++        if scale is not None and (not self._only_master_rank or is_master()):
+             yield f'{layer_prefix}{scale_key}', scale
+ 
+     def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool, layer_prefix: str = ''):
+@@ -535,7 +585,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
+         # `ple` is only non-None on the pp stage owning the PLE layer, so the offload
+         # flag has to be reduced across pp before it can gate the loop below -- that
+         # loop runs pp collectives (broadcast_object_list) and export_table_to_hf runs
+-        # tp ones, and stages disagreeing on whether to enter would deadlock.
++        # EP ones, and stages disagreeing on whether to enter would deadlock.
+         ple_offloaded = self._reduce_tensor_pp_group(ple is not None and ple.ple_embedding.cpu_offload, to_mcore)
+         if to_mcore:
+             # A PEFT/adapter checkpoint carries no PLE n-gram buffers -- those come from the base
+@@ -764,15 +814,7 @@ class Qwen4ExpLoader(ModelLoader):
+         if mtp_block_spec is not None:
+             for layer_spec in mtp_block_spec.layer_specs:
+                 sub = layer_spec.submodules
+-                # The residual_linear_shared head needs Megatron's mHC *projection* form (separate
+-                # e_proj/h_proj slots). megatron-core <= 0.18 only has the fused eh_proj slot, and
+-                # assigning e_proj/h_proj there would silently no-op and surface later as an
+-                # AttributeError on self.e_proj -- so reject early and name the fix.
+-                if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
+-                    raise NotImplementedError(
+-                        'Qwen3.8-Flash-Next MTP requires a Megatron whose MultiTokenPredictionLayerSubmodules '
+-                        'exposes e_proj/h_proj (megatron-core >= 0.19 / dev); got '
+-                        f'{megatron.core.__version__}.')
++                native_split_proj = _has_native_split_mtp_projection(sub)
+                 layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
+                 # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
+                 # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm
+@@ -785,7 +827,15 @@ class Qwen4ExpLoader(ModelLoader):
+                 sub.layer_norm = TENorm
+                 # The MTP inner block is always full-attention (config.mtp.layer_types), independent of
+                 # the backbone layer numbering that Qwen4ExpLayer would otherwise read.
+-                sub.mtp_model_layer.module = Qwen4ExpMTPInnerLayer
++                preferred_inner_name = 'mtp_model_layer' if native_split_proj else 'transformer_layer'
++                fallback_inner_name = 'transformer_layer' if native_split_proj else 'mtp_model_layer'
++                inner_layer = getattr(sub, preferred_inner_name, None)
++                if inner_layer is None:
++                    inner_layer = getattr(sub, fallback_inner_name, None)
++                if inner_layer is None:
++                    raise RuntimeError(
++                        'Unsupported Megatron MTP spec: neither mtp_model_layer nor transformer_layer is present.')
++                inner_layer.module = Qwen4ExpMTPInnerLayer
+         return mtp_block_spec
+ 
+     def build_model(
+diff --git a/src/mcore_bridge/model/modules/hyper_connection_gated.py b/src/mcore_bridge/model/modules/hyper_connection_gated.py
+index 5c94b58f7032ea75d6c025bc8a8919128fdba093..5b99e138ea1b4418117875402ca6b1f2a543dc91 100644
+--- a/src/mcore_bridge/model/modules/hyper_connection_gated.py
++++ b/src/mcore_bridge/model/modules/hyper_connection_gated.py
+@@ -27,16 +27,33 @@ def _duplicated_linear(config, input_size: int, output_size: int) -> TELinear:
+ 
+ class Qwen4ExpTextGroupedRMSNorm(nn.Module):
+ 
+-    def __init__(self, dim: int, group_size: int, eps: float = 1e-6, dtype=None, sequence_parallel: bool = False):
++    def __init__(self,
++                 dim: int,
++                 group_size: int,
++                 eps: float = 1e-6,
++                 dtype=None,
++                 sequence_parallel: bool = False,
++                 use_npu_fusion_rmsnorm: bool = False):
+         super().__init__()
+         self.eps = eps
+         self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype))
+         self.group_size = group_size
++        self.use_npu_fusion_rmsnorm = use_npu_fusion_rmsnorm
+         if dim % group_size != 0:
+             raise ValueError(f'hidden_size ({dim}) must be divisible by group_size ({group_size}).')
+         setattr(self.weight, 'sequence_parallel', sequence_parallel)
+ 
+     def _norm(self, x: torch.Tensor) -> torch.Tensor:
++        if x.numel() == 0:
++            return x
++        if self.use_npu_fusion_rmsnorm and x.device.type == 'npu':
++            import torch_npu
++            # Each row is one group. Keep the independent, zero-centered affine
++            # outside the fused norm, with the original FP32 computation order.
++            grouped = x.reshape(-1, self.group_size)
++            weight = torch.ones(self.group_size, dtype=x.dtype, device=x.device)
++            output = torch_npu.npu_rms_norm(grouped, weight, epsilon=self.eps)[0]
++            return output.reshape(x.shape)
+         x = x.reshape(*x.shape[:-1], -1, self.group_size)
+         out = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+         return out.flatten(-2)
+@@ -74,7 +91,11 @@ class Qwen4ExpTextGatedResidual(nn.Module):
+         # (transformers: Qwen4ExpTextRMSNorm(hc_hidden_size, group_size=self.hidden_size,
+         #  eps=config.rms_norm_eps); layernorm_epsilon is mcore's rms_norm_eps.)
+         self.hc_norm = Qwen4ExpTextGroupedRMSNorm(
+-            hc_hidden_size, group_size=self.hidden_size, eps=config.layernorm_epsilon, dtype=config.params_dtype)
++            hc_hidden_size,
++            group_size=self.hidden_size,
++            eps=config.layernorm_epsilon,
++            dtype=config.params_dtype,
++            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
+         self.input_mix_weight_down = _duplicated_linear(config, hc_hidden_size, config.hc_lowrank)
+         self.input_mix_weight_up = _duplicated_linear(config, config.hc_lowrank, hc_hidden_size)
+         self.block_inject_weight = _duplicated_linear(config, hc_hidden_size, self.hc_count) if use_combine else None
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py b/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py
+index 6231c0b1960f46c6a58825b3965bc606ce2861f8..ddcc98785e2d0cc909bfe5398e2d1fde70e3323a 100644
+--- a/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py
++++ b/src/mcore_bridge/model/modules/kernels/qsa_block_sparse_attn.py
+@@ -79,7 +79,7 @@ def _qsa_bs_fwd_kernel(
+     BLK: tl.constexpr,
+ ):
+     # The selection bitmap exceeds 2 GiB at long context lengths.
+-    pid_t = tl.program_id(0).to(tl.int64)
++    pid_t = tl.program_id(0)
+     pid_h = tl.program_id(1)
+     kv_head = pid_h // GROUP
+ 
+@@ -106,7 +106,7 @@ def _qsa_bs_fwd_kernel(
+     # over the tile's queries; per-query exactness comes from the mask below.
+     n_tiles = tl.load(KCNT + pid_t)
+     for i in range(0, n_tiles):
+-        kt = tl.load(KLIST + pid_t * stride_kl + i).to(tl.int64)
++        kt = tl.load(KLIST + pid_t * stride_kl + i)
+         offs_k = kt * BK + tl.arange(0, BK)
+         k_in = offs_k < T
+ 
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_kernels.py b/src/mcore_bridge/model/modules/kernels/qsa_kernels.py
+index fa57d75167a5f42d5bd3e77a9f0807394408aeea..2670022e1bd3db56f1a2db7279787e67d9196b6e 100644
+--- a/src/mcore_bridge/model/modules/kernels/qsa_kernels.py
++++ b/src/mcore_bridge/model/modules/kernels/qsa_kernels.py
+@@ -1,5 +1,8 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+-"""QSA sparse attention wrappers around the vendored tensor-core triton kernel.
++"""QSA core-attention adapters with selectable Triton and Ascend backends.
++
++``QSA_ATTN_BACKEND=npu_fa`` uses token-exact masks and native Ascend FA, including CP.
++The default remains the vendored Triton implementation described below.
+ 
+ The kernel itself lives in ``qsa_block_sparse_attn.py``, adapted from
+ miles PR #2777 (commit 0f5dff4). This file owns only the glue mcore needs:
+@@ -24,6 +27,8 @@ WHY A KERNEL AT ALL (the decision this file encodes)
+     mathematically equivalent there, and the mask path measures *faster*
+     (8192: 8.4 s/it vs 25.9 s/it) because TE keeps the whole thing fused.
+ """
++import os
++
+ import torch
+ 
+ from mcore_bridge.utils import get_env_args, get_logger
+@@ -34,6 +39,13 @@ logger = get_logger()
+ 
+ QSA_SPARSE_KERNEL_ENV = 'QSA_SPARSE_KERNEL'
+ 
++
++def qsa_attention_backend() -> str:
++    backend = os.environ.get('QSA_ATTN_BACKEND', 'triton').strip().lower()
++    if backend not in ('triton', 'npu_fa'):
++        raise ValueError(f'Unknown QSA_ATTN_BACKEND={backend!r}; choose triton or npu_fa.')
++    return backend
++
+ try:
+     import triton  # noqa: F401  (import guard for the vendored kernel)
+     HAVE_TRITON = True
+@@ -46,12 +58,20 @@ def use_qsa_sparse_kernel() -> bool:
+ 
+ 
+ def qsa_sparse_supported(head_dim: int) -> bool:
+-    """Whether the sparse kernel can run for this head dim.
++    """Whether the requested QSA attention backend can run for this head dim.
+ 
+-    Triton must be importable, ``head_dim`` must be a power of two (the kernel tiles
++    For Triton, ``head_dim`` must be a power of two (the kernel tiles
+     the head with ``tl.arange`` blocks), and the kernel must not be disabled via
+     ``QSA_SPARSE_KERNEL=0``.
+     """
++    if qsa_attention_backend() == 'npu_fa':
++        if not use_qsa_sparse_kernel():
++            raise ValueError('QSA_ATTN_BACKEND=npu_fa cannot be combined with QSA_SPARSE_KERNEL=0: '
++                             'that disables QSA selection under packing.')
++        import torch_npu
++        if not torch_npu.npu.is_available() or head_dim <= 0:
++            raise RuntimeError('QSA_ATTN_BACKEND=npu_fa requires an available Ascend NPU.')
++        return True
+     if not use_qsa_sparse_kernel():
+         return False
+     if not HAVE_TRITON or head_dim <= 0 or (head_dim & (head_dim - 1)):
+@@ -171,7 +191,7 @@ def qsa_sparse_attention(q, k, v, indices, scale, block_size):
+ 
+ 
+ class QSASparseCoreAttention(torch.nn.Module):
+-    """Drop-in ``core_attention`` that runs the QSA sparse triton kernel.
++    """Drop-in ``core_attention`` consuming explicit QSA token selections.
+ 
+     The selection indices ride in on the ``attention_mask`` argument (int64) --
+     the one positional that mcore threads unchanged through both the plain and
+@@ -195,6 +215,8 @@ class QSASparseCoreAttention(torch.nn.Module):
+         # None -> resolved to 1/sqrt(head_dim) at call time, matching TE.
+         self.softmax_scale = softmax_scale
+         self.config = config
++        self.backend = qsa_attention_backend()
++        logger.info(f'QSA core attention backend: {self.backend}')
+         # The kernel tests selection membership per block of compress_ratio
+         # consecutive tokens, so this must be the same value the indexer expanded
+         # its top-k blocks with -- see the contract in qsa_block_sparse_attn.py.
+@@ -215,8 +237,16 @@ class QSASparseCoreAttention(torch.nn.Module):
+         if attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
+             scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1]**-0.5
+             cp_size = self.config.context_parallel_size
++            if self.backend == 'npu_fa' and attention_bias is not None:
++                raise NotImplementedError('The NPU QSA FA backend does not support attention_bias.')
+             if cp_size > 1:
+                 out = self._forward_cp(query, key, value, attention_mask, scale, packed_seq_params)
++            elif self.backend == 'npu_fa':
++                from .qsa_npu_attention import qsa_npu_fusion_attention
++                if attention_bias is not None:
++                    raise NotImplementedError('The NPU QSA FA backend does not support attention_bias.')
++                dropout = getattr(self.config, 'attention_dropout', 0.0) if self.training else 0.0
++                out = qsa_npu_fusion_attention(query, key, value, attention_mask, scale, packed_seq_params, dropout)
+             else:
+                 out = qsa_sparse_attention(query, key, value, attention_mask, scale, self.block_size)
+             # mcore's sbhd core attention returns heads flattened ([s, b, h*d]);
+@@ -270,6 +300,15 @@ class QSASparseCoreAttention(torch.nn.Module):
+ 
+         key_full = _gather_full(key)
+         value_full = _gather_full(value)
++        if self.backend == 'npu_fa':
++            from .qsa_npu_attention import qsa_npu_fusion_attention
++            if q_pos.numel() != query.shape[0]:
++                raise ValueError('CP query positions do not cover the local Q tensor.')
++            local_idx = indices.index_select(0 if thd else 1, q_pos)
++            dropout = getattr(self.config, 'attention_dropout', 0.0) if self.training else 0.0
++            return qsa_npu_fusion_attention(
++                query, key_full, value_full, local_idx, scale, packed_seq_params, dropout,
++                query_positions=q_pos, cp_size=cp_size)
+         # The kernel derives the key bound from the query count (T, Hq, D = q.shape,
+         # then `offs_k < T`), so it structurally requires len(q) == len(k). Under CP
+         # the queries are a 1/cp_size shard while k/v are now full length, so scatter
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_npu_attention.py b/src/mcore_bridge/model/modules/kernels/qsa_npu_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8bd73a72d1efd22bf81f76d4ed3a510b189e392
+--- /dev/null
++++ b/src/mcore_bridge/model/modules/kernels/qsa_npu_attention.py
+@@ -0,0 +1,116 @@
++# Copyright (c) ModelScope Contributors. All rights reserved.
++"""Token-exact QSA masks on the native Ascend training FlashAttention operator.
++
++Each packed document gets its own call: the TND API's single shared SS mask
++cannot encode different content-dependent selections for multiple documents.
++"""
++import torch
++
++
++def packed_document_boundaries(packed_seq_params, total):
++    """Use the same physical token space as Qwen4ExpLayer's packed selector."""
++    cu = getattr(packed_seq_params, 'cu_seqlens_q_padded', None)
++    if cu is None:
++        cu = getattr(packed_seq_params, 'cu_seqlens_q', None)
++    if cu is None:
++        raise ValueError('Packed QSA needs cu_seqlens_q or cu_seqlens_q_padded.')
++    bounds = cu.reshape(-1).tolist() if isinstance(cu, torch.Tensor) else list(cu)
++    if bounds and bounds[0] != 0:
++        if bounds[-1] == total:
++            bounds.insert(0, 0)
++        elif bounds[-1] - bounds[0] == total:
++            first = bounds[0]
++            bounds = [x - first for x in bounds]
++    if (not bounds or bounds[0] != 0 or bounds[-1] != total
++            or any(b < a for a, b in zip(bounds, bounds[1:]))):
++        raise ValueError(f'Cannot align packed QSA boundaries {bounds} with T={total}.')
++    return bounds
++
++
++@torch.no_grad()
++def qsa_indices_to_npu_mask(indices, document_start, document_length, query_positions=None):
++    """[Lq,K] pack token IDs -> [Lq,Lkv] bool mask, True means excluded.
++
++    A separate sentinel column absorbs -1 slots. In particular, holes before
++    valid tail tokens must not mask a real key or terminate the selection.
++    """
++    if indices.ndim != 2:
++        raise ValueError('QSA indices must have one row per document query.')
++    if query_positions is None:
++        if indices.shape[0] != document_length:
++            raise ValueError('Unequal Q/KV lengths need global query positions.')
++        query_positions = torch.arange(document_length, device=indices.device) + document_start
++    elif query_positions.ndim != 1 or query_positions.numel() != indices.shape[0]:
++        raise ValueError('QSA needs one global position for each local query.')
++    local = indices - document_start
++    rows = (query_positions - document_start).unsqueeze(1)
++    valid = (local >= 0) & (local < document_length) & (local <= rows)
++    destinations = torch.where(valid, local, document_length).long()
++    mask = torch.ones((indices.shape[0], document_length + 1), device=indices.device, dtype=torch.bool)
++    mask.scatter_(1, destinations, False)
++    return mask[:, :document_length].contiguous()
++
++
++def _document_attention(query, key, value, indices, document_start, scale, dropout, query_positions=None):
++    import torch_npu
++
++    mask = qsa_indices_to_npu_mask(indices, document_start, key.shape[0], query_positions)
++    # The original main Q/K have already received QK norm and partial RoPE.
++    # Native GQA accepts the local TP ratio, e.g. 3 Q heads : 1 KV head.
++    output = torch_npu.npu_fusion_attention(
++        query.unsqueeze(0).contiguous(),
++        key.unsqueeze(0).contiguous(),
++        value.unsqueeze(0).contiguous(),
++        head_num=query.shape[1],
++        input_layout='BSND',
++        atten_mask=mask,
++        sparse_mode=1,
++        scale=scale,
++        keep_prob=1.0 - dropout,
++    )[0].squeeze(0)
++    return output
++
++
++def qsa_npu_fusion_attention(query, key, value, indices, scale, packed_seq_params=None, dropout=0.0,
++                             query_positions=None, cp_size=1):
++    """Local Q attends full K/V with explicit QSA selections and global positions.
++
++    CP callers gather K/V with autograd before entering here. Packed local Q is
++    still document-major, with each document's front and mirrored back chunks.
++    No zero-filled full-length Q buffer is necessary for native FA.
++    """
++    if query.device.type != 'npu':
++        raise ValueError('QSA_ATTN_BACKEND=npu_fa requires Ascend NPU tensors.')
++    if key.shape != value.shape or cp_size < 1 or query.shape[0] * cp_size != key.shape[0]:
++        raise ValueError('NPU QSA requires local Q length * CP size == full K/V length.')
++    if cp_size > 1 and (query_positions is None or query_positions.numel() != query.shape[0]):
++        raise ValueError('CP QSA requires the global position of every local query.')
++    if query.ndim == 4:
++        # Unpacked sbhd indices use sample-local token IDs.
++        if indices.shape[:2] != (query.shape[1], query.shape[0]):
++            raise ValueError('Unpacked QSA indices must have shape [batch, sequence, K].')
++        outputs = [
++            _document_attention(query[:, b], key[:, b], value[:, b], indices[b], 0, scale, dropout,
++                                query_positions)
++            for b in range(query.shape[1])
++        ]
++        return torch.stack(outputs, dim=1)
++    if query.ndim != 3 or indices.ndim != 2 or indices.shape[0] != query.shape[0]:
++        raise ValueError('Packed QSA expects Q [T,N,D] and indices [T,K].')
++    if packed_seq_params is None:
++        bounds = [0, key.shape[0]]
++    else:
++        bounds = packed_document_boundaries(packed_seq_params, key.shape[0])
++    outputs, local_start = [], 0
++    for start, end in zip(bounds, bounds[1:]):
++        length = end - start
++        if cp_size > 1 and length % (2 * cp_size):
++            raise ValueError('Packed CP QSA requires each physical document padded to 2 * CP size.')
++        local_end = local_start + length // cp_size
++        if length:
++            positions = None if query_positions is None else query_positions[local_start:local_end]
++            outputs.append(_document_attention(
++                query[local_start:local_end], key[start:end], value[start:end],
++                indices[local_start:local_end], start, scale, dropout, positions))
++        local_start = local_end
++    return torch.cat(outputs, dim=0)
+diff --git a/src/mcore_bridge/model/modules/kernels/qsa_npu_indexer.py b/src/mcore_bridge/model/modules/kernels/qsa_npu_indexer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..773e92af372e3e6cb94a430a8ef407235270cad6
+--- /dev/null
++++ b/src/mcore_bridge/model/modules/kernels/qsa_npu_indexer.py
+@@ -0,0 +1,127 @@
++# Copyright (c) ModelScope Contributors. All rights reserved.
++"""Ascend LightningIndexerV2 scoring for frozen QSA compressed key blocks."""
++import math
++
++import torch
++
++
++def _torch_topk_rows(query, block_keys, row_ids, cu_seqlens, full_blocks,
++                     visible_blocks, topk, chunk_bytes):
++    """Rescore ambiguous rows per document, preferring earlier blocks on ties.
++
++    Match QSAIndexer's packed Torch backend: both the candidate space and stable
++    ordering must follow the current baseline, rather than the old global TopK.
++    Callers supply only pruning rows, which have more than ``topk`` visible blocks.
++    """
++    result = torch.empty((row_ids.numel(), topk), dtype=torch.long, device=query.device)
++    bounds = cu_seqlens.tolist()
++    counts = full_blocks.tolist()
++    block_start = 0
++    for (start, end), count in zip(zip(bounds, bounds[1:]), counts):
++        positions = ((row_ids >= start) & (row_ids < end)).nonzero().flatten()
++        if positions.numel():
++            doc_rows = row_ids.index_select(0, positions)
++            keys = block_keys[block_start:block_start + count].float()
++            block_ids = torch.arange(count, device=query.device)
++            chunk = max(1, chunk_bytes // max(1, query.shape[1] * count * 4))
++            for offset in range(0, doc_rows.numel(), chunk):
++                rows = doc_rows[offset:offset + chunk]
++                scores = torch.einsum('thd,kd->thk', query[rows].float(), keys)
++                scores = scores.relu().sum(1) / math.sqrt(query.shape[-1])
++                valid = block_ids[None, :] < visible_blocks[rows, None]
++                scores.masked_fill_(~valid, -torch.inf)
++                selected = torch.sort(scores, dim=-1, descending=True, stable=True).indices[:, :topk]
++                result[positions[offset:offset + rows.numel()]] = selected + block_start
++        block_start += count
++    return result
++
++
++@torch.no_grad()
++def lightning_topk_blocks(query, block_keys, cu_seqlens, full_blocks,
++                          visible_blocks, topk, compress_ratio, chunk_bytes):
++    """Return pack-global block IDs and keep flags for the packed QSA selector.
++
++    Pooling, normalization, and RoPE are performed by QSAIndexer before this call.
++    One extra candidate exposes the TopK boundary. Ambiguous pruning rows use the
++    same per-document FP32/stable selection as the current Torch backend.
++    """
++    if query.device.type != 'npu' or query.dtype not in (torch.bfloat16, torch.float16):
++        raise ValueError('Ascend QSA indexer requires BF16/FP16 NPU query/key tensors.')
++    if query.shape[-1] != 128 or not 0 <= topk < 2048:
++        raise ValueError('Ascend QSA indexer currently requires head_dim=128 and 0 <= block_topk < 2048.')
++    selected = torch.zeros((query.shape[0], topk), dtype=torch.long, device=query.device)
++    keep = torch.zeros_like(selected, dtype=torch.bool)
++    if topk == 0:
++        return selected, keep
++    try:
++        from cann_ops_transformer.ops import lightning_indexer, lightning_indexer_metadata
++    except ImportError as error:
++        raise ImportError('Add $ASCEND_HOME_PATH/python/site-packages to PYTHONPATH for '
++                          'QSA_INDEXER_BACKEND=ascendc.') from error
++
++    bounds = cu_seqlens.tolist()
++    counts = full_blocks.tolist()
++    block_offsets = [0]
++    for count in counts:
++        block_offsets.append(block_offsets[-1] + count)
++    long_docs = []
++    for doc, (start, end) in enumerate(zip(bounds, bounds[1:])):
++        count = counts[doc]
++        if count > topk:
++            long_docs.append(doc)
++        elif count:
++            local_blocks = torch.arange(count, device=query.device)
++            selected[start:end, :count] = block_offsets[doc] + local_blocks
++            keep[start:end, :count] = local_blocks[None, :] < visible_blocks[start:end, None]
++    if not long_docs:
++        return selected, keep
++
++    qs, ks, row_ids = [], [], []
++    cuq, cuk, residuals = [0], [0], []
++    for doc in long_docs:
++        start, end = bounds[doc], bounds[doc + 1]
++        qs.append(query[start:end])
++        ks.append(block_keys[block_offsets[doc]:block_offsets[doc + 1]])
++        row_ids.append(torch.arange(start, end, device=query.device))
++        cuq.append(cuq[-1] + end - start)
++        cuk.append(cuk[-1] + counts[doc])
++        residuals.append((end - start) % compress_ratio)
++    q = torch.cat(qs).contiguous()
++    k = torch.cat(ks).unsqueeze(1).contiguous()
++    rows = torch.cat(row_ids)
++    cuq_t = torch.tensor(cuq, device=query.device, dtype=torch.int32)
++    cuk_t = torch.tensor(cuk, device=query.device, dtype=torch.int32)
++    residual_t = torch.tensor(residuals, device=query.device, dtype=torch.int32)
++    weights = torch.full(q.shape[:2], 1 / math.sqrt(query.shape[-1]),
++                         device=query.device, dtype=torch.float32)
++    native_topk = topk + 1
++    metadata = lightning_indexer_metadata(
++        q.shape[1], 1, q.shape[-1], native_topk,
++        cu_seqlens_q=cuq_t, cu_seqlens_k=cuk_t, cmp_residual_k=residual_t,
++        batch_size=len(long_docs), max_seqlen_q=max(b - a for a, b in zip(cuq, cuq[1:])),
++        max_seqlen_k=max(counts[d] for d in long_docs), layout_q='TND', layout_k='TND',
++        mask_mode=3, cmp_ratio=compress_ratio)
++    native_ids, native_values = lightning_indexer(
++        q, k, weights, native_topk, cu_seqlens_q=cuq_t, cu_seqlens_k=cuk_t,
++        cmp_residual_k=residual_t, metadata=metadata, layout_q='TND', layout_k='TND',
++        mask_mode=3, cmp_ratio=compress_ratio, return_value=1)
++    native_ids = native_ids.squeeze(1).long()
++    native_values = native_values.squeeze(1)
++    for i, doc in enumerate(long_docs):
++        start, end = bounds[doc], bounds[doc + 1]
++        local = native_ids[cuq[i]:cuq[i + 1], :topk]
++        valid = (local >= 0) & (local < visible_blocks[start:end, None])
++        selected[start:end] = torch.where(valid, local + block_offsets[doc], 0)
++        keep[start:end] = valid
++
++    # Preserve stable Torch selection when rounding or ties can change the set.
++    pruning = visible_blocks[rows] > topk
++    left, right = native_values[:, topk - 1], native_values[:, topk]
++    tolerance = 1e-4 * (1.0 + torch.maximum(left.abs(), right.abs()))
++    fallback_rows = rows[pruning & ((left - right) <= tolerance)]
++    if fallback_rows.numel():
++        selected[fallback_rows] = _torch_topk_rows(
++            query, block_keys, fallback_rows, cu_seqlens, full_blocks,
++            visible_blocks, topk, chunk_bytes)
++        keep[fallback_rows] = True
++    return selected, keep
+diff --git a/src/mcore_bridge/model/modules/ple.py b/src/mcore_bridge/model/modules/ple.py
+index a39f2d4682a30335d051d29951cb6b4ea1ea02ff..bf1439c7648aaad97b44173e915616660b696540 100644
+--- a/src/mcore_bridge/model/modules/ple.py
++++ b/src/mcore_bridge/model/modules/ple.py
+@@ -4,19 +4,22 @@ import math
+ import torch
+ import torch.nn.functional as F
+ from megatron.core import parallel_state
++from megatron.core.dist_checkpointing.mapping import ShardedTensor
+ from megatron.core.extensions.transformer_engine import TELinear
+ from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
+-from megatron.core.tensor_parallel import VocabParallelEmbedding
+-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
+-                                                    scatter_to_sequence_parallel_region)
++from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
++from megatron.core.tensor_parallel.mappings import all_to_all, gather_from_sequence_parallel_region
++from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+ from megatron.core.transformer.utils import (ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint,
+-                                             sharded_state_dict_default)
++                                            sharded_state_dict_default)
+ from torch import nn
++from transformers.utils import is_torch_npu_available
+ from typing import List, Optional
+ 
+ from ...utils import get_env_args, get_logger
+ from ...utils.constants import EXPORT_CHUNK_BYTES
+-from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
++from ...utils.megatron_utils import (_thd_partitioned_indices_torch, _undo_attention_load_balancing_thd_torch,
++                                    get_num_samples, reconstruct_tensor_cp)
+ from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
+ from .kernels import gather_ple_rows, ple_gate_conv_triton
+ 
+@@ -100,6 +103,56 @@ def _nth_prime_after(start: int, count: int) -> int:
+     return prime
+ 
+ 
++class _EPRowParallelEmbedding(nn.Module):
++    """Disjoint table rows on EP; replicas and optimizer states use expert-DP."""
++
++    def __init__(self, config, vocab_size: int, head_dim: int):
++        super().__init__()
++        if config.expert_tensor_parallel_size != 1:
++            raise ValueError('PLE EP row sharding requires expert_tensor_parallel_size=1.')
++        self.ep_group = parallel_state.get_expert_model_parallel_group()
++        self.ep_rank = self.ep_group.rank()
++        self.ep_size = self.ep_group.size()
++        if vocab_size % self.ep_size:
++            raise ValueError(f'PLE padded vocab size {vocab_size} must be divisible by EP size {self.ep_size}.')
++        rows_per_rank = vocab_size // self.ep_size
++        self.vocab_start_index = self.ep_rank * rows_per_rank
++        self.vocab_end_index = self.vocab_start_index + rows_per_rank
++        device = 'cpu' if config.use_cpu_initialization else torch.cuda.current_device()
++        self.weight = nn.Parameter(torch.empty(rows_per_rank, head_dim, dtype=config.params_dtype, device=device))
++        # This also prevents gnorm from treating distinct EP shards as dense-TP replicas.
++        # Checkpoint offsets below explicitly describe EP, independently of this flag.
++        set_tensor_model_parallel_attributes(self.weight, is_parallel=True, dim=0, stride=1)
++        self.weight.allreduce = False
++        if config.perform_initialization:
++            with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
++                if self.weight.device.type == 'cpu':
++                    # Initialize only the local shard, without consuming the CPU/default RNG.
++                    initialized = torch.empty_like(self.weight, device=torch.cuda.current_device())
++                    nn.init.normal_(initialized)
++                    with torch.no_grad():
++                        self.weight.copy_(initialized)
++                else:
++                    nn.init.normal_(self.weight)
++
++    def forward(self, local_rows: torch.Tensor) -> torch.Tensor:
++        # Empty owner input must still connect the parameter to the response all-to-all.
++        return F.embedding(local_rows, self.weight)
++
++    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
++        axis = len(sharded_offsets)
++        return {
++            f'{prefix}weight': ShardedTensor.from_rank_offsets(
++                f'{prefix}weight',
++                self.weight,
++                *sharded_offsets,
++                (axis, self.ep_rank, self.ep_size),
++                prepend_axis_num=axis,
++                replica_id=(0, 0, parallel_state.get_expert_data_parallel_rank()),
++            )
++        }
++
++
+ class Qwen4ExpTextNGramEmbedding(nn.Module):
+ 
+     def __init__(self, config, ple_layer_index: int):
+@@ -160,31 +213,21 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+         self.padded_vocab_size = padded_vocab_size
+         self.cpu_offload = use_ple_cpu_offload()
+         if self.cpu_offload:
+-            # Warn rather than raise: whether this is safe depends on the train type,
+-            # which the model config does not carry (see use_ple_cpu_offload).
+-            get_logger().warning_once('PLE_CPU_OFFLOAD=1: the n-gram table is host-resident and receives no '
+-                                      'gradient, so it stays frozen.')
+-            self._init_host_table(config, padded_vocab_size, head_dim_per_ngram)
+-        else:
+-            # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
+-            self.ngram_embedding = VocabParallelEmbedding(
+-                padded_vocab_size,
+-                head_dim_per_ngram,
+-                init_method=torch.nn.init.normal_,
+-                config=config,
+-            )
++            raise NotImplementedError('PLE EP training requires PLE_CPU_OFFLOAD=0; optimizer CPU offload is supported.')
++        self.ngram_embedding = _EPRowParallelEmbedding(config, padded_vocab_size, head_dim_per_ngram)
+ 
+     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+         metadata = ensure_metadata_has_dp_cp_group(metadata)
+         tp_group = parallel_state.get_tensor_model_parallel_group()
+-        # Hash buffers are replicated; the embedding supplies its own TP metadata.
++        # Hash buffers keep their dense replica layout; the table describes its own EP offsets.
+         state_dict = {}
+         self._save_to_state_dict(state_dict, '', keep_vars=True)
+         state_dict = make_sharded_tensors_for_checkpoint(
+             state_dict, prefix, sharded_offsets=sharded_offsets, tp_group=tp_group, dp_cp_group=metadata['dp_cp_group'])
+         for name, module in self.named_children():
+             state_dict.update(
+-                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group))
++                sharded_state_dict_default(
++                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group))
+         return state_dict
+ 
+     # The PLE ngram embedding table is stored in the checkpoint as F8_E4M3 shards
+@@ -193,21 +236,19 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+     _NGRAM_SCALE_KEY = 'ple.ple_embedding.ngram_embedding.weight_scale'
+ 
+     def fill_table_from_hf(self, hf_state_dict):
+-        """Populate the (local TP partition of the) n-gram table from the HF
+-        checkpoint shards at load time.
++        """Populate the local row partition of the n-gram table from the HF
++        checkpoint shards at load time. The embedding exposes its actual EP row range.
+         """
+         total = self.padded_vocab_size
+         parts = self.split_ngram_parts
+         shard_size = (total + parts - 1) // parts
+-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+         if self.cpu_offload:
+-            tp_start, tp_end = self.vocab_start, self.vocab_end
++            local_start, local_end = self.vocab_start, self.vocab_end
+             dtype = self.host_table.dtype
+         else:
+             emb = self.ngram_embedding
+-            per_partition = emb.num_embeddings_per_partition
+-            tp_start = tp_rank * per_partition
+-            tp_end = min((tp_rank + 1) * per_partition, total)
++            local_start = emb.vocab_start_index
++            local_end = emb.vocab_end_index
+             dtype = emb.weight.dtype
+         # The fp8 shards must be multiplied by the scalar `weight_scale` before
+         # being written into the bf16 table. Checkpoints that store the table in
+@@ -225,43 +266,44 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+             if key not in hf_state_dict:
+                 continue
+             cs, ce = i * shard_size, min((i + 1) * shard_size, total)
+-            s, e = max(cs, tp_start), min(ce, tp_end)
++            s, e = max(cs, local_start), min(ce, local_end)
+             if s >= e:
+                 continue
+             weight = hf_state_dict[key].load()
+             if scale is not None:
+                 weight = weight.to(torch.float32) * scale
+             if self.cpu_offload:
+-                self.host_table[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(
++                self.host_table[s - local_start:e - local_start] = weight[s - cs:e - cs].to(
+                     dtype=dtype, device=self.host_table.device)
+             else:
+-                emb.weight.data[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(dtype)
++                emb.weight.data[s - local_start:e - local_start] = weight[s - cs:e - cs].to(dtype)
+ 
+     @torch.no_grad()
+     def iter_export_table_to_hf(self, prefix=''):
+         """Generator variant of ``export_table_to_hf``: produce one shard at a
+         time so the 100GB-scale table never accumulates on the exporting rank --
+         the consumer (the safetensors writer) drives the pace and each shard can
+-        be released once written. Non-zero TP ranks execute the same all_reduces
+-        but yield nothing. The collectives advance only while the generator is
+-        being consumed.
++        be released once written. Every EP rank yields one item per shard;
++        non-leaders use None so callers advance collectives in the same order.
+         """
+         with torch.no_grad():
+             total = self.padded_vocab_size
+             parts = self.split_ngram_parts
+             shard_size = (total + parts - 1) // parts
+-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+-            tp_group = parallel_state.get_tensor_model_parallel_group()
+-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+             if self.cpu_offload:
+                 table = self.host_table
+-                tp_start, tp_end = self.vocab_start, self.vocab_end
++                local_start, local_end = self.vocab_start, self.vocab_end
++                export_group = parallel_state.get_tensor_model_parallel_group()
+                 device = torch.cuda.current_device()
+             else:
+-                table = self.ngram_embedding.weight
+-                tp_start = tp_rank * self.ngram_embedding.num_embeddings_per_partition
+-                tp_end = min(tp_start + table.shape[0], total)
++                emb = self.ngram_embedding
++                table = emb.weight
++                local_start = emb.vocab_start_index
++                local_end = emb.vocab_end_index
++                export_group = emb.ep_group
+                 device = table.device
++            export_rank = export_group.rank()
++            export_size = export_group.size()
+             # Inverse of fill_table_from_hf: the checkpoint format is fp8 shards +
+             # scalar `weight_scale`, so divide by the scale stashed during loading
+             # and cast back to fp8. Without a known scale the values cannot be
+@@ -274,7 +316,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+                                      'embedding without re-quantizing to fp8.')
+             # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned
+             # CPU. Each rank scatters its owned rows into shard chunks, sums across
+-            # TP (rows are disjoint, so sum == gather), then rank 0 assembles the
++            # the table's shard group (rows are disjoint, so sum == gather), then rank 0 assembles the
+             # shard on CPU chunk by chunk. Chunking bounds the GPU transient: a
+             # shard can be far larger than the free VRAM left while the training
+             # state is still resident.
+@@ -286,38 +328,36 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+                 # Accumulate the shard on CPU chunk by chunk; assigning inside the
+                 # loop would keep only the last chunk of each shard.
+                 shard = None
+-                if tp_rank == 0:
++                if export_rank == 0:
+                     shard = torch.zeros(ce - cs, table.shape[-1], dtype=out_dtype, device='cpu')
+                 for start in range(cs, ce, chunk_rows):
+                     end = min(ce, start + chunk_rows)
+                     local = torch.zeros(end - start, table.shape[-1], dtype=table.dtype, device=device)
+-                    s, e = max(start, tp_start), min(end, tp_end)
++                    s, e = max(start, local_start), min(end, local_end)
+                     if s < e:
+-                        local[s - start:e - start] = table[s - tp_start:e - tp_start].to(device)
+-                    if tp_size > 1:
+-                        torch.distributed.all_reduce(local, group=tp_group)
+-                    if tp_rank == 0:
++                        local[s - start:e - start] = table[s - local_start:e - local_start].to(device)
++                    if export_size > 1:
++                        torch.distributed.all_reduce(local, group=export_group)
++                    if export_rank == 0:
+                         # Re-quantize after the all_reduce: fp8 is not a valid accumulation
+                         # dtype for NCCL, and the sum must happen in the loaded dtype.
+                         if scale is not None:
+                             local = (local.to(torch.float32) / scale.to(local.device)).to(torch.float8_e4m3fn)
+                         shard[start - cs:end - cs] = local.cpu()
+-                if tp_rank == 0:
+-                    yield f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight', shard
+-            if tp_rank == 0 and scale is not None:
++                yield f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight', shard
++            if export_rank == 0 and scale is not None:
+                 yield f'{prefix}{self._NGRAM_SCALE_KEY}', scale.reshape(())
+ 
+     @torch.no_grad()
+     def export_table_to_hf(self, hf_state_dict, prefix=''):
+         """Reverse of ``fill_table_from_hf``: write the current table back as HF
+-        shards so a full-parameter checkpoint is self-contained. Works for both
+-        the host-resident (``PLE_CPU_OFFLOAD=1``) table and the TP-sharded
+-        ``VocabParallelEmbedding`` (the default, which receives gradients and so
+-        must not be silently dropped from the checkpoint). Bulk API: consumes
++        shards so a full-parameter checkpoint is self-contained. The trainable
++        table is EP-sharded and is exported in its trained dtype. Bulk API: consumes
+         :meth:`iter_export_table_to_hf` into ``hf_state_dict``.
+         """
+         for key, tensor in self.iter_export_table_to_hf(prefix):
+-            hf_state_dict[key] = tensor
++            if tensor is not None:
++                hf_state_dict[key] = tensor
+ 
+     def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
+         # Mirrors transformers `_shift_right_ignore_eos`: segment-aware shift,
+@@ -337,12 +377,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+         valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
+         return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
+ 
+-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        """input_ids: [rows, L] -> embeddings [rows, L, embedding_dim].
++    def _build_ngram_ids(self, input_ids: torch.Tensor, packed_seq_lens: Optional[List[int]] = None) -> torch.Tensor:
++        """Construct global row IDs before selecting CP/SP-local requests.
+ 
+         Training variant of transformers ``forward(input_ids, past_key_values,
+-        layer_idx)``: the previous context is eos padding (fresh request),
+-        prepended here and dropped from the ids afterwards.
++        layer_idx)``: unpacked inputs prepend eos history for a fresh request;
++        packed inputs reset that history at each segment boundary.
+         """
+         input_ids = input_ids.long()
+         # mcore-specific: training has no conv-state cache; a fresh request
+@@ -350,9 +390,18 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+         # of transformers `forward` returns exactly this). The latest HF
+         # constructor also takes a cache-only `layer_idx`, which has no
+         # training counterpart.
+-        previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
+-        token_history = torch.cat([previous_context, input_ids], dim=-1)
+-        shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
++        if packed_seq_lens is not None:
++            # Reset history at packed boundaries as well as after EOS tokens.
++            # Concatenate the histories before hashing so lookup communicates once.
++            segments = input_ids.split(packed_seq_lens, dim=1)
++            shifted_tokens = [
++                torch.cat([self._shift_right_ignore_eos(segment, shift) for segment in segments], dim=1)
++                for shift in range(self.ngram_size)
++            ]
++        else:
++            previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
++            token_history = torch.cat([previous_context, input_ids], dim=-1)
++            shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
+ 
+         blocks = []
+         for ngram in range(2, self.ngram_size + 1):
+@@ -369,10 +418,57 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
+             ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
+             blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
+ 
+-        ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
+-        if self.cpu_offload:
+-            return self._host_lookup(ngram_ids)
+-        return self.ngram_embedding(ngram_ids).flatten(-2)
++        return torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
++
++    def _ep_lookup(self, ngram_ids: torch.Tensor) -> torch.Tensor:
++        """Route IDs to row owners and return differentiable vectors in request order."""
++        emb = self.ngram_embedding
++        if emb.ep_size == 1:
++            return emb(ngram_ids).flatten(-2)
++        ids = ngram_ids.reshape(-1)
++        rows_per_rank = emb.weight.shape[0]
++        owners = ids // rows_per_rank
++        permutation = torch.argsort(owners)
++        send_counts = torch.bincount(owners, minlength=emb.ep_size)
++        recv_counts = torch.empty_like(send_counts)
++        torch.distributed.all_to_all_single(recv_counts, send_counts, group=emb.ep_group)
++        # One host transfer for both split lists, never one .item() per peer.
++        send_counts, recv_counts = torch.stack((send_counts, recv_counts)).cpu().tolist()
++        received_ids = ids.new_empty(sum(recv_counts))
++        torch.distributed.all_to_all_single(
++            received_ids,
++            ids.index_select(0, permutation),
++            output_split_sizes=recv_counts,
++            input_split_sizes=send_counts,
++            group=emb.ep_group,
++        )
++        owner_values = emb(received_ids - emb.vocab_start_index)
++        # Response splits reverse the ID exchange; backward sends gradients to owners.
++        returned = all_to_all(emb.ep_group, owner_values, send_counts, recv_counts)
++        inverse = torch.empty_like(permutation)
++        inverse[permutation] = torch.arange(ids.numel(), device=ids.device)
++        return returned.index_select(0, inverse).reshape(*ngram_ids.shape, self.head_dim).flatten(-2)
++
++    def forward(self,
++                input_ids: torch.Tensor,
++                packed_seq_lens: Optional[List[int]] = None,
++                *,
++                local_token_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
++        real_end = sum(packed_seq_lens) if packed_seq_lens is not None else input_ids.shape[1]
++        ngram_ids = self._build_ngram_ids(input_ids[:, :real_end], packed_seq_lens)
++        if local_token_indices is None:
++            return self._ep_lookup(ngram_ids)
++        local_positions = torch.nonzero(local_token_indices < real_end, as_tuple=True)[0]
++        selected = local_token_indices.index_select(0, local_positions)
++        embeddings = self._ep_lookup(ngram_ids.index_select(1, selected))
++        output = embeddings.new_zeros(input_ids.shape[0], local_token_indices.numel(), self.ngram_heads * self.head_dim)
++        if local_positions.numel() == 0:
++            # No scatter is needed for an empty source. A standalone zero tensor
++            # would skip response all-to-all backward, so retain that dependency.
++            # Include a zero element to avoid an empty reduction on the backend.
++            dependency = torch.cat((embeddings.reshape(-1), embeddings.new_zeros(1))).sum() * 0
++            return output + dependency
++        return output.index_copy(1, local_positions, embeddings)
+ 
+     def _init_host_table(self, config, padded_vocab_size, head_dim):
+         tp_size = parallel_state.get_tensor_model_parallel_world_size()
+@@ -438,6 +534,10 @@ class Qwen4ExpTextPLELayer(nn.Module):
+         super().__init__()
+         self.config = config
+         self.pg_collection = pg_collection
++        self.tp_group = pg_collection.tp if pg_collection is not None else parallel_state.get_tensor_model_parallel_group()
++        self.cp_group = parallel_state.get_context_parallel_group()
++        if self.tp_group.size() > 1 and not config.sequence_parallel:
++            raise ValueError('PLE EP training requires sequence_parallel=True when TP>1.')
+         self.hidden_size = int(config.hidden_size)
+         self.hc_count = int(config.hc_count)
+         ple_embed_dim = int(config.ple_embed_dim)
+@@ -474,19 +574,22 @@ class Qwen4ExpTextPLELayer(nn.Module):
+             group_size=self.hidden_size,
+             eps=config.layernorm_epsilon,
+             dtype=config.params_dtype,
+-            sequence_parallel=config.sequence_parallel)
++            sequence_parallel=config.sequence_parallel,
++            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
+         self.norm_query = Qwen4ExpTextGroupedRMSNorm(
+             hc_hidden_size,
+             group_size=self.hidden_size,
+             eps=config.layernorm_epsilon,
+             dtype=config.params_dtype,
+-            sequence_parallel=config.sequence_parallel)
++            sequence_parallel=config.sequence_parallel,
++            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
+         self.norm_conv = Qwen4ExpTextGroupedRMSNorm(
+             hc_hidden_size,
+             group_size=self.hidden_size,
+             eps=config.layernorm_epsilon,
+             dtype=config.params_dtype,
+-            sequence_parallel=config.sequence_parallel)
++            sequence_parallel=config.sequence_parallel,
++            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
+         self.conv1d = nn.Conv1d(
+             hc_hidden_size,
+             hc_hidden_size,
+@@ -497,16 +600,19 @@ class Qwen4ExpTextPLELayer(nn.Module):
+             dtype=config.params_dtype,
+         )
+         nn.init.zeros_(self.conv1d.weight)
+-        replicated_prefixes = ('key_proj', 'value_proj', 'norm_key', 'norm_query', 'norm_conv', 'conv1d')
+-        for name, param in self.named_parameters():
+-            if name.startswith(replicated_prefixes) or name.endswith('norm.weight'):
+-                # The SP forward gathers the full sequence, so every TP rank already
+-                # produces the complete gradient: sync the replicas with AVG instead of
+-                # the SP SUM, which would amplify the grads by tp_size.
+-                setattr(param, 'sequence_parallel', False)
+-                setattr(param, 'average_gradients_across_tp_domain', config.sequence_parallel)
+-
+-    def _short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        # Duplicated TELinear and the three norms already carry this flag. Their
++        # local-token gradients, and the local-output conv gradients, require TP SUM.
++        self.conv1d.weight.sequence_parallel = config.sequence_parallel
++
++    def _short_conv(self, hidden_states: torch.Tensor, packed_seq_lens: Optional[List[int]] = None) -> torch.Tensor:
++        if (getattr(self.config, 'use_npu_fusion_ple_conv', False) and hidden_states.device.type == 'npu'
++                and hidden_states.numel() > 0 and packed_seq_lens is not None and not self.config.deterministic_mode):
++            return self._short_conv_npu(hidden_states, packed_seq_lens)
++        if packed_seq_lens is not None:
++            # Only participating samples are present; alignment padding never
++            # launches its own convolution when real-sample metadata is available.
++            return torch.cat(
++                [self._short_conv(segment) for segment in hidden_states.split(packed_seq_lens, dim=1)], dim=1)
+         # Training variant of transformers `_short_conv` (no conv state cache):
+         # causal alignment is achieved by left-padding the conv input with
+         # zeros (equivalent to trimming the padded conv output), which is a
+@@ -517,14 +623,52 @@ class Qwen4ExpTextPLELayer(nn.Module):
+         conv_input = conv_input[..., -(self.short_conv_state_len + sequence_length):]
+         return F.silu(self.conv1d(conv_input)).transpose(1, 2)
+ 
+-    def compute(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+-        """Mirrors transformers ``Qwen4ExpTextPLELayer.forward`` (training
+-        variant); hidden_states/input_ids: [rows, L, nH]/[rows, L]."""
+-        embeddings = self.ple_embedding(input_ids)  # mcore-specific: no past_key_values cache arg
+-        if use_ple_fused_kernel() and embeddings.device.type != 'cpu':
+-            fused = self._compute_fused(hidden_states, embeddings)
+-            if fused is not None:
+-                return fused
++    def _short_conv_npu(self, hidden_states: torch.Tensor, packed_seq_lens: List[int]) -> torch.Tensor:
++        """Turn dilated convolution into one packed causal convolution without padding."""
++        if get_env_args('FLA_DISABLE_BACKEND_DISPATCH', bool, False):
++            raise RuntimeError('PLE NPU fused convolution requires FLA backend dispatch to be enabled.')
++        # Use the original FLA entry, not MindSpeed's replacement of the convolution re-export.
++        from fla.modules.conv.causal_conv1d import causal_conv1d
++
++        dilation = self.conv1d.dilation[0]
++        total = hidden_states.shape[1]
++        permutation = []
++        sub_cu = [0]
++        start = 0
++        for length in packed_seq_lens:
++            end = start + length
++            # Each residue has independent zero history. Empty residues are omitted.
++            for residue in range(min(dilation, length)):
++                permutation.extend(range(start + residue, end, dilation))
++                sub_cu.append(len(permutation))
++            start = end
++        if start != total:
++            raise ValueError(f'PLE packed lengths sum to {start}, but convolution input length is {total}.')
++
++        inverse = [0] * total
++        for new_position, original_position in enumerate(permutation):
++            inverse[original_position] = new_position
++        device = hidden_states.device
++        permutation = torch.tensor(permutation, dtype=torch.long, device=device)
++        inverse = torch.tensor(inverse, dtype=torch.long, device=device)
++        cu_cpu = torch.tensor(sub_cu, dtype=torch.long)
++        cu = cu_cpu.to(device=device)
++        reordered = hidden_states.index_select(1, permutation)
++        output, _ = causal_conv1d(
++            x=reordered,
++            weight=self.conv1d.weight.squeeze(1),
++            bias=None,
++            initial_state=None,
++            output_final_state=False,
++            activation='silu',
++            backend='triton',
++            cu_seqlens=cu,
++            cu_seqlens_cpu=cu_cpu,
++        )
++        return output.index_select(1, inverse)
++
++    def compute(self, hidden_states: torch.Tensor, embeddings: torch.Tensor):
++        """Local [B,L,...] projections/norms/gate; communication precedes convolution."""
+         key_normed = self.norm_key(self.key_proj(embeddings)[0]).unflatten(-1, (self.hc_count, self.hidden_size))
+         value = self.value_proj(embeddings)[0]
+         query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
+@@ -533,10 +677,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
+         gated_value = torch.sigmoid(gate) * value.unsqueeze(-2)
+         gated_value_normed = self.norm_conv(gated_value.flatten(-2))
+         gated_value = gated_value.flatten(-2)
+-        # (transformers also applies conv_mask here; training relies on the
+-        # loss mask instead.)
+-        output = gated_value + self._short_conv(gated_value_normed)
+-        return output
++        return gated_value, gated_value_normed
+ 
+     def _compute_fused(self, hidden_states: torch.Tensor, embeddings: torch.Tensor):
+         """Fused triton chain (gate + norm_conv + causal conv + SiLU + residual);
+@@ -586,101 +727,86 @@ class Qwen4ExpTextPLELayer(nn.Module):
+                              f'length {total} under sequence parallelism.')
+         return cu
+ 
+-    def forward(
+-        self,
+-        hidden_states: torch.Tensor,
+-        input_ids: torch.Tensor,
+-        packed_seq_params=None,
+-    ) -> torch.Tensor:
+-        """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T].
+-
+-        mcore-specific wrapper (no counterpart in transformers): TP needs no
+-        special handling (replicated weights, full-width hidden between
+-        blocks); under SP/CP the shard is gathered to the full sequence
+-        (undoing SP first, then the CP zigzag), ``compute`` runs on the full
+-        sequence, and the additive output is scattered back.
+-        """
+-        sp_on = (
+-            self.pg_collection is not None and self.config.sequence_parallel
+-            and self.config.tensor_model_parallel_size > 1)
+-        cp_on = self.config.context_parallel_size > 1
+-        if not (sp_on or cp_on):
+-            return self._forward_impl(hidden_states, input_ids, packed_seq_params)
+-
+-        thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
+-
+-        # ---- gather the shard into the full sequence (SP shard is innermost) ----
+-        if sp_on:
+-            hidden_states = gather_from_sequence_parallel_region(
+-                hidden_states, tensor_parallel_output_grad=False, group=self.pg_collection.tp)
+-        if cp_on:
+-            # For packed (thd) inputs the data pipeline (swift get_batch_on_this_cp_rank)
+-            # zigzag-splits hidden/input_ids per sample via cu_seqlens_q while keeping
+-            # packed_seq_params itself global, so the undo uses the same cu.
+-            psp_for_cp = packed_seq_params if thd else None
+-            hidden_states = gather_from_sequence_parallel_region(
+-                hidden_states, tensor_parallel_output_grad=True, group=parallel_state.get_context_parallel_group())
+-            hidden_states = _undo_attention_load_balancing(hidden_states,
+-                                                           parallel_state.get_context_parallel_world_size(), psp_for_cp)
+-            # The data pipeline may hand us either a CP-sharded or a full copy of
+-            # input_ids; re-align only when the lengths disagree.
+-            if input_ids.shape[-1] != hidden_states.shape[0]:
+-                input_ids = reconstruct_tensor_cp(input_ids, psp_for_cp, dim=1)
+-        elif input_ids.shape[-1] != hidden_states.shape[0]:
+-            raise ValueError(f'PLE input_ids length {input_ids.shape[-1]} does not match the gathered '
+-                             f'sequence length {hidden_states.shape[0]} under sequence parallelism; '
+-                             'gpt_model is expected to pass the full, unsharded input_ids.')
+-
+-        if thd:
+-            # SP keeps one global cu_seqlens copy per rank; normalize padded/offset
+-            # forms against the gathered total so cu indexes the full sequence.
+-            # copy.copy (not dataclasses.replace) preserves dynamically attached
+-            # fields such as `num_samples` that the data pipeline relies on.
+-            cu = self._normalize_cu_seqlens(getattr(packed_seq_params, 'cu_seqlens_q', None), hidden_states.shape[0])
+-            psp = copy.copy(packed_seq_params)
+-            psp.cu_seqlens_q = cu
+-            packed_seq_params = psp
+-
+-        out = self._forward_impl(hidden_states, input_ids, packed_seq_params)
+-
+-        # ---- scatter the additive output back to the caller's shard ----
+-        if cp_on:
+-            out = split_cp_inputs(out, getattr(packed_seq_params, 'cu_seqlens_q', None) if thd else None, dim=0)
+-        if sp_on:
+-            out = scatter_to_sequence_parallel_region(out, group=self.pg_collection.tp)
+-        return out
+-
+-    def _forward_impl(
+-        self,
+-        hidden_states: torch.Tensor,
+-        input_ids: torch.Tensor,
+-        packed_seq_params=None,
+-    ) -> torch.Tensor:
+-        """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T]."""
+-        thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
+-        if thd:
+-            num_samples = get_num_samples(packed_seq_params)
+-            # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
+-            # normalizes it to int, so `.item()` would raise AttributeError;
+-            # tolerate a 0-d tensor from other callers.
+-            max_seqlen_q = packed_seq_params.max_seqlen_q
+-            max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
+-            cu = packed_seq_params.cu_seqlens_q
+-            total = hidden_states.shape[0]
+-            hid = hidden_states.new_zeros((num_samples, max_len, hidden_states.shape[-1]))
+-            toks = input_ids.new_full((num_samples, max_len), self.ple_embedding.eos_token_id)
+-            for i in range(num_samples):
+-                start, end = int(cu[i]), int(cu[i + 1])
+-                hid[i, :end - start] = hidden_states[start:end, 0]
+-                toks[i, :end - start] = input_ids[0, start:end]
+-            res = self.compute(hid, toks)
+-            out = res.new_zeros((total, 1, res.shape[-1]))
+-            for i in range(num_samples):
+-                start, end = int(cu[i]), int(cu[i + 1])
+-                out[start:end, 0] = res[i, :end - start]
+-            return out
++    def _prepare_local_layout(self, hidden_states, input_ids, packed_seq_params):
++        if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', None) != 'thd':
++            raise NotImplementedError('PLE EP local-sequence computation currently supports THD inputs only.')
++        if (hidden_states.ndim != 3 or hidden_states.shape[1] != 1 or input_ids.ndim != 2
++                or input_ids.shape[0] != 1):
++            raise ValueError('PLE THD expects local hidden_states [L,1,H] and input_ids [1,T] or [1,T/CP].')
++        sp_size = self.tp_group.size() if self.config.sequence_parallel else 1
++        cp_size = self.cp_group.size()
++        total = hidden_states.shape[0] * sp_size * cp_size
++        # Keep dynamically attached num_samples/seq_lens while aligning both boundary views.
++        psp = copy.copy(packed_seq_params)
++        psp.cu_seqlens_q = self._normalize_cu_seqlens(psp.cu_seqlens_q, total)
++        psp.cu_seqlens_q_padded = self._normalize_cu_seqlens(getattr(psp, 'cu_seqlens_q_padded', None), total)
++        packed_seq_lens = self._get_packed_seq_lens(psp, total)
++        if input_ids.shape[1] != total:
++            if cp_size > 1 and input_ids.shape[1] == total // cp_size:
++                input_ids = reconstruct_tensor_cp(input_ids, psp, dim=1)
++            else:
++                raise ValueError(f'PLE input_ids length {input_ids.shape[1]} does not match full length {total} '
++                                 f'or CP-local length {total // cp_size}.')
++        if cp_size > 1:
++            indices = _thd_partitioned_indices_torch(
++                psp.cu_seqlens_q, cp_size, self.cp_group.rank(), hidden_states.device)
+         else:
+-            # [s, b, nH] -> [b, s, nH]; input_ids [b, s]
+-            hid = hidden_states.transpose(0, 1)
+-            res = self.compute(hid, input_ids)
+-            return res.transpose(0, 1).contiguous()
++            indices = torch.arange(total, device=hidden_states.device)
++        if sp_size > 1:
++            indices = indices.narrow(0, self.tp_group.rank() * hidden_states.shape[0], hidden_states.shape[0])
++        return input_ids, psp, packed_seq_lens, indices
++
++    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, packed_seq_params=None) -> torch.Tensor:
++        """THD: keep hidden/projections local; gather only normalized conv inputs."""
++        input_ids, psp, packed_seq_lens, local_indices = self._prepare_local_layout(
++            hidden_states, input_ids, packed_seq_params)
++        real_end = sum(packed_seq_lens)
++        total = input_ids.shape[1]
++        embeddings = self.ple_embedding(input_ids, packed_seq_lens, local_token_indices=local_indices)
++        gated_value, gated_value_normed = self.compute(hidden_states.transpose(0, 1), embeddings)
++        # Megatron gathers DIMENSION ZERO: never pass batch-first [B,L,H] here.
++        full_normed = gated_value_normed.transpose(0, 1).contiguous()
++        if self.config.sequence_parallel and self.tp_group.size() > 1:
++            full_normed = gather_from_sequence_parallel_region(
++                full_normed, tensor_parallel_output_grad=True, group=self.tp_group)
++        if self.cp_group.size() > 1:
++            full_normed = gather_from_sequence_parallel_region(
++                full_normed, tensor_parallel_output_grad=True, group=self.cp_group)
++            if is_torch_npu_available():
++                full_normed = _undo_attention_load_balancing_thd_torch(full_normed, self.cp_group.size(), psp)
++            else:
++                full_normed = _undo_attention_load_balancing(full_normed, self.cp_group.size(), psp)
++        # Every rank executes the conv branch, including ranks with no local real
++        # outputs. Indexing/masking must retain both gather backwards in that case.
++        full_conv = self._short_conv(
++            full_normed.transpose(0, 1).contiguous()[:, :real_end], packed_seq_lens=packed_seq_lens)
++        if real_end < total:
++            full_conv = F.pad(full_conv, (0, 0, 0, total - real_end))
++        local_conv = full_conv.index_select(1, local_indices)
++        output = gated_value + local_conv
++        output = output.masked_fill((local_indices >= real_end).view(1, -1, 1), 0)
++        return output.transpose(0, 1).contiguous()
++
++    @staticmethod
++    def _get_packed_seq_lens(packed_seq_params, total: int) -> List[int]:
++        """Resolve participating segments in the gathered, original-order layout.
++
++        With real-sample metadata, trailing alignment segments are excluded.
++        Otherwise get_num_samples keeps its existing all-segments fallback.
++        """
++        cu = getattr(packed_seq_params, 'cu_seqlens_q', None)
++        if cu is None:
++            raise ValueError('PLE THD computation requires cu_seqlens_q.')
++        cu_padded = getattr(packed_seq_params, 'cu_seqlens_q_padded', None)
++        if cu_padded is not None and cu_padded is not cu and not torch.equal(cu.reshape(-1), cu_padded.reshape(-1)):
++            raise ValueError('PLE THD computation requires cu_seqlens_q and cu_seqlens_q_padded '
++                             'to describe the same storage layout.')
++        # Transfer boundaries once; embedding and convolution reuse Python lengths.
++        boundaries = cu.detach().reshape(-1).cpu().tolist()
++        if (len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != total
++                or any(end <= start for start, end in zip(boundaries[:-1], boundaries[1:]))):
++            raise ValueError(f'PLE THD boundaries must start at 0, increase strictly, and end at {total}.')
++        num_samples = get_num_samples(packed_seq_params)
++        if not 1 <= num_samples < len(boundaries):
++            raise ValueError(f'PLE THD segment count {num_samples} is invalid for {len(boundaries) - 1} segments.')
++        return [boundaries[i + 1] - boundaries[i] for i in range(num_samples)]
+diff --git a/src/mcore_bridge/model/modules/qsa_indexer.py b/src/mcore_bridge/model/modules/qsa_indexer.py
+index d65b4c5daf49e510e1e341e52bbbe5627c012e3d..2e90f34f01c9503133924b9554917af5ea8aa813 100644
+--- a/src/mcore_bridge/model/modules/qsa_indexer.py
++++ b/src/mcore_bridge/model/modules/qsa_indexer.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) ModelScope Contributors. All rights reserved.
+ import math
++import os
+ import torch
+ from megatron.core.extensions.transformer_engine import TELinear
+ from torch import nn
+@@ -12,14 +13,26 @@ _QSA_INDEX_SCORE_CHUNK_BYTES = 1024 * 1024 * 1024
+ 
+ class Qwen4ExpTextRMSNorm(nn.Module):
+ 
+-    def __init__(self, dim: int, eps: float = 1e-6, dtype=None, sequence_parallel: bool = False):
++    def __init__(self,
++                 dim: int,
++                 eps: float = 1e-6,
++                 dtype=None,
++                 sequence_parallel: bool = False,
++                 use_npu_fusion_rmsnorm: bool = False):
+         super().__init__()
+         self.eps = eps
++        self.use_npu_fusion_rmsnorm = use_npu_fusion_rmsnorm
+         self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype))
+         # Replicated across TP; reduce grads across TP when SP is on.
+         setattr(self.weight, 'sequence_parallel', sequence_parallel)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
++        if self.use_npu_fusion_rmsnorm and x.device.type == 'npu' and x.numel() > 0:
++            import torch_npu
++
++            # Match the reference's FP32 affine and cast only after scaling.
++            out = torch_npu.npu_rms_norm(x.float(), 1.0 + self.weight.float(), epsilon=self.eps)[0]
++            return out.type_as(x)
+         out = x.float()
+         out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + self.eps)
+         # zero-centered: (1 + w), and Qwen4ExpText casts after scaling
+@@ -132,6 +145,9 @@ class QSAIndexer(nn.Module):
+         self.compress_ratio = config.indexer_compress_ratio
+         self.token_budget = config.indexer_budget
+         self.block_topk = self.token_budget // self.compress_ratio
++        self.indexer_backend = os.environ.get('QSA_INDEXER_BACKEND', 'torch').strip().lower()
++        if self.indexer_backend not in ('torch', 'ascendc'):
++            raise ValueError(f'Unknown QSA_INDEXER_BACKEND={self.indexer_backend!r}.')
+         self.index_qk_proj = TELinear(
+             input_size=config.hidden_size,
+             output_size=(self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
+@@ -146,12 +162,14 @@ class QSAIndexer(nn.Module):
+             self.index_head_dim,
+             eps=config.layernorm_epsilon,
+             dtype=config.params_dtype,
+-            sequence_parallel=config.sequence_parallel)
++            sequence_parallel=config.sequence_parallel,
++            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
+         self.k_layernorm = Qwen4ExpTextRMSNorm(
+             self.index_head_dim,
+             eps=config.layernorm_epsilon,
+             dtype=config.params_dtype,
+-            sequence_parallel=config.sequence_parallel)
++            sequence_parallel=config.sequence_parallel,
++            use_npu_fusion_rmsnorm=getattr(config, 'use_npu_fusion_rmsnorm', False))
+         setattr(self.index_qk_proj.weight, 'sequence_parallel', config.sequence_parallel)
+         # QSA selection is non-differentiable and always runs without autograd.
+         # Keep its pretrained parameters out of optimizer groups and DDP buckets.
+@@ -184,6 +202,8 @@ class QSAIndexer(nn.Module):
+             ``top_blocks``/``keep`` are ``[b, s, k]`` (``k =
+             min(block_topk, max_blocks)``) and ``n_blocks`` is ``[s]``.
+         """
++        if self.indexer_backend != 'torch':
++            raise NotImplementedError('QSA_INDEXER_BACKEND=ascendc currently requires packing/padding_free THD.')
+         s, b, _ = hidden_states.shape
+         R = self.compress_ratio
+         max_blocks = s // R
+@@ -210,7 +230,18 @@ class QSAIndexer(nn.Module):
+ 
+         def apply_rope(t, cos_, sin_):
+             t_rope, t_pass = t[..., :rot], t[..., rot:]
+-            t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
++            if getattr(self.config, 'use_npu_fusion_rope', False) and t.device.type == 'npu' and t_rope.numel() > 0:
++                from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
++
++                shape = t_rope.shape
++                if t_rope.ndim == 3:
++                    # Pooled keys [B,NB,D] need a singleton head dimension.
++                    t_rope = t_rope.unsqueeze(2)
++                    cos_, sin_ = cos_.unsqueeze(2), sin_.unsqueeze(2)
++                t_rope = npu_rotary_position_embedding(
++                    t_rope.contiguous(), cos_.contiguous(), sin_.contiguous(), mode=0).reshape(shape)
++            else:
++                t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
+             return torch.cat((t_rope, t_pass), dim=-1)
+ 
+         # queries rotate at their own position: cos [bf, s, rot] -> [bf, s, 1, rot]
+@@ -387,7 +418,18 @@ class QSAIndexer(nn.Module):
+ 
+         def apply_rope(t, cos_, sin_):
+             t_rope, t_pass = t[..., :rot], t[..., rot:]
+-            t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
++            if getattr(self.config, 'use_npu_fusion_rope', False) and t.device.type == 'npu' and t_rope.numel() > 0:
++                from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
++
++                # Normalize packed queries [T,N,D] and block keys [NB,D] to SBND.
++                shape = t_rope.shape
++                t_rope = t_rope.reshape(t_rope.shape[0], 1, -1, rot)
++                cos_ = cos_.reshape(cos_.shape[0], 1, -1, rot)
++                sin_ = sin_.reshape(sin_.shape[0], 1, -1, rot)
++                t_rope = npu_rotary_position_embedding(
++                    t_rope.contiguous(), cos_.contiguous(), sin_.contiguous(), mode=0).reshape(shape)
++            else:
++                t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
+             return torch.cat((t_rope, t_pass), dim=-1)
+ 
+         q = apply_rope(q, cos.unsqueeze(1), sin.unsqueeze(1))  # [T, nh, d]
+@@ -413,8 +455,14 @@ class QSAIndexer(nn.Module):
+ 
+         # ---- score only in-document blocks, chunked over queries ----
+         q_nblocks = (pos_in_doc + 1) // R  # [T]
+-        top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
+-        k = top_blocks.shape[1]
++        if self.indexer_backend == 'ascendc':
++            from .kernels.qsa_npu_indexer import lightning_topk_blocks
++            k = min(self.block_topk, NB)
++            top_blocks, keep = lightning_topk_blocks(
++                q, block_keys, cu_seqlens, full_blocks, q_nblocks, k, R, _QSA_INDEX_SCORE_CHUNK_BYTES)
++        else:
++            top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
++            k = top_blocks.shape[1]
+ 
+         # ---- top-k blocks -> token indices ----
+         arange_r = torch.arange(R, device=device)
+diff --git a/src/mcore_bridge/model/modules/transformer_layer.py b/src/mcore_bridge/model/modules/transformer_layer.py
+index 7dd0796a289803ce3a8b9d25215da8eaf3ca3ef5..d4fb6ceb6041a19f56facef0352d971f4953300a 100644
+--- a/src/mcore_bridge/model/modules/transformer_layer.py
++++ b/src/mcore_bridge/model/modules/transformer_layer.py
+@@ -290,7 +290,13 @@ class TransformerLayer(McoreTransformerLayer):
+             if inverse:
+                 sin_ = -sin_
+ 
+-            t = (t * cos_) + (rope_utils._rotate_half(t, rotary_interleaved) * sin_)
++            if getattr(self.config, 'use_npu_fusion_rope', False) and t.device.type == 'npu' and t.numel() > 0:
++                from mindspeed.ops.npu_rotary_position_embedding import npu_rotary_position_embedding
++
++                mode = 1 if rotary_interleaved else 0
++                t = npu_rotary_position_embedding(t.contiguous(), cos_.contiguous(), sin_.contiguous(), mode=mode)
++            else:
++                t = (t * cos_) + (rope_utils._rotate_half(t, rotary_interleaved) * sin_)
+             # Fallback to original permutation
+             # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
+             # The existing MLA code is safe because the dot product is permutation-invariant.
+diff --git a/src/mcore_bridge/utils/megatron_utils.py b/src/mcore_bridge/utils/megatron_utils.py
+index 03c0863968c6fc32fe75c8d8113e34d3281e208b..3c85af4712f21606dbf2747eeb9602c9f71692e7 100644
+--- a/src/mcore_bridge/utils/megatron_utils.py
++++ b/src/mcore_bridge/utils/megatron_utils.py
+@@ -12,6 +12,7 @@ from megatron.core.transformer.transformer_block import get_num_layers_to_build
+ from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+ from packaging import version
+ from transformers import set_seed
++from transformers.utils import is_torch_npu_available
+ from typing import Optional
+ 
+ from .logger import get_logger
+@@ -115,6 +116,161 @@ def get_num_samples(packed_seq_params) -> int:
+     return int(packed_seq_params.cu_seqlens_q.numel()) - 1
+ 
+ 
++def _thd_partitioned_indices_torch(
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    device,
++) -> torch.Tensor:
++    """Pure-Torch equivalent of TE's thd_get_partitioned_indices."""
++
++    cu = cu_seqlens.reshape(-1).to(
++        device=device,
++        dtype=torch.long,
++    )
++
++    starts = cu[:-1]
++    ends = cu[1:]
++    seq_lens = ends - starts
++
++    if torch.any(seq_lens <= 0):
++        raise RuntimeError(
++            f"THD CP requires positive sequence lengths, got {seq_lens}"
++        )
++
++    divisor = 2 * cp_size
++    if torch.any(seq_lens % divisor != 0):
++        raise RuntimeError(
++            "THD CP requires every packed sequence length to be "
++            f"divisible by 2*cp_size={divisor}, "
++            f"got lengths={seq_lens}"
++        )
++
++    chunk = seq_lens // divisor
++
++    # Rank r owns:
++    #   front chunk r
++    #   back  chunk (2*cp_size-r-1)
++    front_starts = starts + cp_rank * chunk
++    back_starts = ends - (cp_rank + 1) * chunk
++
++    seg_starts = torch.stack(
++        (front_starts, back_starts),
++        dim=1,
++    ).reshape(-1)
++
++    seg_lens = torch.stack(
++        (chunk, chunk),
++        dim=1,
++    ).reshape(-1)
++
++    # Expand [segment_start, segment_length]
++    # into token indices without Python-side per-token loops.
++    nz = seg_lens > 0
++    seg_starts = seg_starts[nz]
++    seg_lens = seg_lens[nz]
++
++    seg_ids = torch.repeat_interleave(
++        torch.arange(
++            seg_lens.numel(),
++            device=device,
++            dtype=torch.long,
++        ),
++        seg_lens,
++    )
++
++    prefix = torch.cumsum(seg_lens, dim=0) - seg_lens
++
++    offsets = torch.arange(
++        int(seg_lens.sum().item()),
++        device=device,
++        dtype=torch.long,
++    )
++
++    offsets -= torch.repeat_interleave(
++        prefix,
++        seg_lens,
++    )
++
++    return seg_starts.index_select(0, seg_ids) + offsets
++
++
++def _undo_attention_load_balancing_thd_torch(
++    input_: torch.Tensor,
++    cp_size: int,
++    packed_seq_params,
++) -> torch.Tensor:
++
++    cu = packed_seq_params.cu_seqlens_q_padded
++
++    if cu is None:
++        cu = packed_seq_params.cu_seqlens_q
++
++    if cu is None:
++        raise RuntimeError(
++            "THD CP reconstruction requires "
++            "cu_seqlens_q_padded or cu_seqlens_q."
++        )
++
++    total_tokens = input_.shape[0]
++
++    cu = cu.reshape(-1)
++
++    if int(cu[-1].item()) != total_tokens:
++        raise RuntimeError(
++            "THD CP metadata does not match gathered tensor: "
++            f"cu[-1]={int(cu[-1].item())}, "
++            f"total_tokens={total_tokens}"
++        )
++
++    # gathered layout is:
++    #
++    #   [rank0_local,
++    #    rank1_local,
++    #    ...
++    #    rankN_local]
++    #
++    # Build the global token positions represented by each row.
++    rank_major_positions = torch.cat(
++        [
++            _thd_partitioned_indices_torch(
++                cu,
++                cp_size,
++                rank,
++                input_.device,
++            )
++            for rank in range(cp_size)
++        ],
++        dim=0,
++    )
++
++    if rank_major_positions.numel() != total_tokens:
++        raise RuntimeError(
++            "Invalid THD CP reconstruction index size: "
++            f"{rank_major_positions.numel()} vs {total_tokens}"
++        )
++
++    # rank_major_positions[j] means: gathered[j] belongs to global position rank_major_positions[j].
++    # Build inverse permutation so that: output[global_position] = gathered[j]
++    restore_order = torch.empty(
++        total_tokens,
++        dtype=torch.long,
++        device=input_.device,
++    )
++
++    restore_order.scatter_(
++        0,
++        rank_major_positions,
++        torch.arange(
++            total_tokens,
++            device=input_.device,
++            dtype=torch.long,
++        ),
++    )
++
++    return input_.index_select(0, restore_order)
++
++
+ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode: str = 'zigzag') -> torch.Tensor:
+     """In CP mode, all-gather and undo the chunking produced by
+     ``split_cp_inputs``, restoring the full sequence in original token order
+@@ -163,7 +319,20 @@ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode
+     # `_undo_attention_load_balancing` assumes sequence dim is 0; transpose if needed.
+     if dim != 0:
+         gathered = gathered.transpose(0, dim).contiguous()
+-    out = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
++    if packed_seq_params is not None and is_torch_npu_available():
++        # THD path: TE-free implementation for NPU.
++        out = _undo_attention_load_balancing_thd_torch(
++            gathered,
++            cp_size,
++            packed_seq_params,
++        )
++    else:
++        out = _undo_attention_load_balancing(
++            gathered,
++            cp_size,
++            packed_seq_params,
++        )
++
+     if dim != 0:
+         out = out.transpose(0, dim).contiguous()
+     return out
