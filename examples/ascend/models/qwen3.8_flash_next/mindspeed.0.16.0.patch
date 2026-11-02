@@ -1,0 +1,34 @@
+diff --git a/mindspeed/core/tensor_parallel/vocab_parallel/vocab_parallel.py b/mindspeed/core/tensor_parallel/vocab_parallel/vocab_parallel.py
+index 2d7e2421e8edc1e899838fd917de989ea18953ec..b397de6f7bdcb4742156e7ce40ac58c4f103e39f 100644
+--- a/mindspeed/core/tensor_parallel/vocab_parallel/vocab_parallel.py
++++ b/mindspeed/core/tensor_parallel/vocab_parallel/vocab_parallel.py
+@@ -49,9 +49,9 @@ def vocab_parallel_embedding_forward_impl(
+     if self.reduce_scatter_embeddings:
+         # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+         output_parallel = output_parallel.transpose(0, 1).contiguous()
+-        output = reduce_scatter_to_sequence_parallel_region(output_parallel)
++        output = reduce_scatter_to_sequence_parallel_region(output_parallel, group=self.tp_group)
+     else:
+         # Reduce across all the model parallel GPUs.
+-        output = reduce_from_tensor_model_parallel_region(output_parallel)
++        output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+     return output
+ 
+diff --git a/mindspeed/te/pytorch/module/grouped_linear.py b/mindspeed/te/pytorch/module/grouped_linear.py
+index 4c611c6a1dc6f685591ec9db29c90c280dd4eb4a..93f9dbfd916ec4760cd9ff3e3be47ea716092e07 100644
+--- a/mindspeed/te/pytorch/module/grouped_linear.py
++++ b/mindspeed/te/pytorch/module/grouped_linear.py
+@@ -159,6 +159,13 @@ class TEGroupedLinear(torch.nn.Module):
+                                                   world_size=tp_size)
+                 else:
+                     _initialize_affine_weight_gpu(expert_weight, init_method, partition_dim=self.partition_dim, stride=1, is_expert=is_expert)
++            # Fix missing TP metadata when perform_initialization=False
++            if not hasattr(expert_weight, "tensor_model_parallel"):
++                setattr(
++                    expert_weight,
++                    "tensor_model_parallel",
++                    True,
++                )
+             self.total_weight.append(expert_weight)
+ 
+         for param in self.parameters():
