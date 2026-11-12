@@ -15,16 +15,14 @@ export GLOO_SOCKET_IFNAME=xxx
 export HCCL_SOCKET_IFNAME=xxx
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
-export HCCL_HOST_SOCKET_PORT_RANGE="auto"                    
+export HCCL_HOST_SOCKET_PORT_RANGE="auto"
 export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
 export MAX_JOBS="${MAX_JOBS:-4}"
 
-# 以下依赖没有安装的话，需要将路径添加到 PYTHONPATH
+# Megatron-LM 和 MindSpeed 通过源码加载，请修改以下路径
 export PYTHONPATH=/path/to/Megatron-LM:$PYTHONPATH
 export PYTHONPATH=/path/to/MindSpeed:$PYTHONPATH
-export PYTHONPATH=/path/to/mcore-bridge:$PYTHONPATH
-export PYTHONPATH=/path/to/ms-swift:$PYTHONPATH
 
 export QWEN_CHECKPOINT_TIMEOUT_SECOND=3600
 export USE_MCORE_GDN=1
@@ -33,7 +31,7 @@ export PLE_CPU_OFFLOAD=0
 export PLE_FUSED_KERNEL=0
 
 export QSA_ATTN_BACKEND="${QSA_ATTN_BACKEND:-npu_fa}"
-export QSA_INDEXER_BACKEND="${QSA_INDEXER_BACKEND:-ascendc}"  
+export QSA_INDEXER_BACKEND="${QSA_INDEXER_BACKEND:-ascendc}"
 
 export MODEL=/path/to/Qwen3.8-Flash-Next
 export DATASET=/path/to/dataset
@@ -80,8 +78,6 @@ megatron sft \
     --padding_free true \
     --train_iters 100 \
     --finetune true \
-    --mtp_num_layers 1 \
-    --mtp_loss_scaling_factor 0.1 \
     --cross_entropy_loss_fusion true \
     --use_precision_aware_optimizer false \
     --optimizer_cpu_offload true \
